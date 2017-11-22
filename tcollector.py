@@ -179,6 +179,7 @@ class Collector(object):
             # one full line is now found and we can pull it out of the buffer
             line = self.buffer[0:idx].strip()
             if line:
+                line = "%s %d" % (line, self.interval)
                 self.datalines.append(line)
                 self.last_datapoint = int(time.time())
             self.buffer = self.buffer[idx+1:]
@@ -331,16 +332,17 @@ class ReaderThread(threading.Thread):
             LOG.warning('%s line too long: %s', col.name, line)
             col.lines_invalid += 1
             return
-        parsed = re.match('^([-_./a-zA-Z0-9]+)\s+' # Metric name.
-                          '(\d+\.?\d+)\s+'               # Timestamp.
-                          '(\S+?)'                 # Value (int or float).
-                          '((?:\s+[-_./a-zA-Z0-9]+=[-_./a-zA-Z0-9]+)*)$', # Tags
+        parsed = re.match('^([-_./a-zA-Z0-9]+)\s+'  # Metric name.
+                          '(\d+\.?\d+)\s+'  # Timestamp.
+                          '(\S+?)'  # Value (int or float).
+                          '((?:\s+[-_./a-zA-Z0-9]+=[-_./a-zA-Z0-9]+)*)\s+'
+                          '(\d+)$',  # Tags
                           line)
         if parsed is None:
             LOG.warning('%s sent invalid data: %s', col.name, line)
             col.lines_invalid += 1
             return
-        metric, timestamp, value, tags = parsed.groups()
+        metric, timestamp, value, tags, step = parsed.groups()
         timestamp = int(timestamp)
 
         # If there are more than 11 digits we're dealing with a timestamp
@@ -731,40 +733,53 @@ class SenderThread(threading.Thread):
             protocol = "https"
         else:
             protocol = "http"
+        """
         details=""
         if LOG.level == logging.DEBUG:
             details="?details"
-        return "%s://%s:%s/%s%s" % (protocol, self.host, self.port, self.http_api_path, details)
+        """
+        return "%s://%s:%s/%s" % (protocol, self.host, self.port, self.http_api_path)
 
     def send_data_via_http(self):
         """Sends outstanding data in self.sendq to TSD in one HTTP API call."""
         metrics = []
         for line in self.sendq:
             # print " %s" % line
-            parts = line.split(None, 3)
+            parts = line.split(None, 4)
             # not all metrics have metric-specific tags
-            if len(parts) == 4:
-              (metric, timestamp, value, raw_tags) = parts
+            if len(parts) == 5:
+                (metric, timestamp, value, raw_tags, step) = parts
             else:
-              (metric, timestamp, value) = parts
-              raw_tags = ""
+                (metric, timestamp, value, step) = parts
+                raw_tags = ""
             # process the tags
-            metric_tags = {}
+            p = re.compile("\s+")
+            raw_tags = p.sub(",", raw_tags)
+            """metric_tags = {}
             for tag in raw_tags.strip().split():
                 (tag_key, tag_value) = tag.split("=", 1)
-                metric_tags[tag_key] = tag_value
+                metric_tags[tag_key] = tag_value"""
             metric_entry = {}
+            metric_entry["step"] = step
             metric_entry["metric"] = metric
             metric_entry["timestamp"] = long(timestamp)
             metric_entry["value"] = float(value)
-            metric_entry["tags"] = dict(self.tags).copy()
-            if len(metric_tags) + len(metric_entry["tags"]) > self.maxtags:
-              metric_tags_orig = set(metric_tags)
-              subset_metric_keys = frozenset(metric_tags[:len(metric_tags[:self.maxtags-len(metric_entry["tags"])])])
-              metric_tags = dict((k, v) for k, v in metric_tags.iteritems() if k in subset_metric_keys)
-              LOG.error("Exceeding maximum permitted metric tags - removing %s for metric %s",
-                        str(metric_tags_orig - set(metric_tags)), metric)
-            metric_entry["tags"].update(metric_tags)
+            config_tags = dict(self.tags).copy()
+            metric_entry["endpoint"] = config_tags.pop('host')
+            metric_entry["tags"] = ",".join(["=".join(i) for i in config_tags.items()])
+            """if len(metric_tags) + len(metric_entry["tags"]) > self.maxtags:
+                metric_tags_orig = set(metric_tags)
+                subset_metric_keys = frozenset(
+                    metric_tags[:len(metric_tags[:self.maxtags - len(metric_entry["tags"])])])
+                metric_tags = dict((k, v) for k, v in metric_tags.iteritems() if k in subset_metric_keys)
+                LOG.error("Exceeding maximum permitted metric tags - removing %s for metric %s",
+                          str(metric_tags_orig - set(metric_tags)), metric)"""
+
+            if metric_entry["tags"].strip() == '':
+                metric_entry["tags"] = raw_tags
+            else:
+                metric_entry["tags"] = metric_entry["tags"] + "," + raw_tags
+            metric_entry['counterType'] = 'GAUGE'
             metrics.append(metric_entry)
 
         if self.dryrun:
@@ -777,7 +792,7 @@ class SenderThread(threading.Thread):
             self.pick_connection()
 
         url = self.build_http_url()
-        LOG.debug("Sending metrics to url", url)
+        LOG.debug("Sending metrics to url %s", url)
         req = urllib2.Request(url)
         if self.http_username and self.http_password:
           req.add_header("Authorization", "Basic %s"
@@ -926,7 +941,7 @@ def parse_cmdline(argv):
     parser.add_option('--backup-count', dest='backup_count', type='int',
                         default=defaults['backup_count'], help='Maximum number of logfiles to backup.')
     parser.add_option('--logfile', dest='logfile', type='str',
-                        default=DEFAULT_LOG,
+                        default=defaults['logfile'],
                         help='Filename where logs are written to.')
     parser.add_option('--reconnect-interval',dest='reconnectinterval', type='int',
                         default=defaults['reconnectinterval'], metavar='RECONNECTINTERVAL',
@@ -1362,7 +1377,7 @@ def spawn_collector(col):
     # other logic and it makes no sense to update the last spawn time if the
     # collector didn't actually start.
     col.lastspawn = int(time.time())
-    # Without setting last_datapoint here, a long running check (>15s) will be 
+    # Without setting last_datapoint here, a long running check (>15s) will be
     # killed by check_children() the first time check_children is called.
     col.last_datapoint = col.lastspawn
     set_nonblocking(col.proc.stdout.fileno())
